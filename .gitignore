@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+/target_release/
+build_out/
+*.exe
+
+# Local app configuration and logs
+adb_gui_config.json
+*.log
+
+# Windows thumbnail caches
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
