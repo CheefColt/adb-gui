@@ -20,6 +20,27 @@ pub struct DeviceInfo {
     pub reversed_ports: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdnsService {
+    pub name: String,
+    pub service_type: String,
+    pub ip: String,
+    pub port: u16,
+}
+
+fn clean_service_name(name: &str) -> String {
+    // If name ends with " (N)" where N is collision number, strip it
+    if let Some(idx) = name.rfind(" (") {
+        if name.ends_with(')') {
+            let inner = &name[idx + 2..name.len() - 1];
+            if inner.chars().all(|c| c.is_ascii_digit()) {
+                return name[..idx].trim().to_string();
+            }
+        }
+    }
+    name.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct AdbManager {
     pub custom_adb_path: Option<String>,
@@ -345,5 +366,128 @@ impl AdbManager {
             }
         }
         Ok(list)
+    }
+
+    pub fn list_mdns_services(&self) -> Result<Vec<MdnsService>, String> {
+        let out = self.run_command(&["mdns", "services"])?;
+        let mut services = Vec::new();
+
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("List of discovered mdns services") || line.starts_with('*') {
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let addr_str = parts[parts.len() - 1];
+                let service_type = parts[parts.len() - 2].to_string();
+                let raw_name = parts[..parts.len() - 2].join(" ");
+                let name = clean_service_name(&raw_name);
+
+                if let Some((ip, port_str)) = addr_str.rsplit_once(':') {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        services.push(MdnsService {
+                            name,
+                            service_type,
+                            ip: ip.to_string(),
+                            port,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Fast TCP probe (200ms) to filter out stale/closed ports left in ADB's mDNS cache
+        let mut active_services = Vec::new();
+        for s in &services {
+            let addr_str = format!("{}:{}", s.ip, s.port);
+            let is_alive = if let Ok(sock) = addr_str.parse::<std::net::SocketAddr>() {
+                std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_millis(200)).is_ok()
+            } else {
+                false
+            };
+
+            if is_alive {
+                active_services.push(s.clone());
+            }
+        }
+
+        // If probing verified active services, use them; otherwise fall back to raw list
+        let pool = if !active_services.is_empty() {
+            active_services
+        } else {
+            services
+        };
+
+        // Deduplicate: if multiple entries exist for the same device (ip & clean name),
+        // keep the newest one (last in the list)
+        let mut deduped: Vec<MdnsService> = Vec::new();
+        for s in pool {
+            if let Some(pos) = deduped.iter().position(|existing| existing.ip == s.ip && existing.name == s.name) {
+                deduped[pos] = s;
+            } else {
+                deduped.push(s);
+            }
+        }
+
+        Ok(deduped)
+    }
+
+    pub fn pair_and_auto_connect(
+        &self,
+        pair_address: &str,
+        pair_code: &str,
+        explicit_connect_port: Option<u16>,
+    ) -> Result<String, String> {
+        let pair_out = self.pair(pair_address, pair_code)?;
+
+        // Extract IP from address string (supports "192.168.1.5:12345" or "192.168.1.5")
+        let ip = match pair_address.split_once(':') {
+            Some((ip_part, _)) => ip_part.trim(),
+            None => pair_address.trim(),
+        };
+
+        if let Some(port) = explicit_connect_port {
+            let target = format!("{}:{}", ip, port);
+            match self.connect(&target) {
+                Ok(conn_out) => {
+                    return Ok(format!("Paired successfully! {}\nConnected: {}", pair_out, conn_out));
+                }
+                Err(conn_err) => {
+                    return Ok(format!(
+                        "Paired successfully ({}), but connect to {} failed: {}",
+                        pair_out, target, conn_err
+                    ));
+                }
+            }
+        }
+
+        // Try discovering connection port via mDNS (Android 11+ TLS connect service)
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        if let Ok(services) = self.list_mdns_services() {
+            if let Some(svc) = services.iter().find(|s| s.ip == ip && s.service_type.contains("_adb-tls-connect")) {
+                let target = format!("{}:{}", svc.ip, svc.port);
+                match self.connect(&target) {
+                    Ok(_) => {
+                        return Ok(format!(
+                            "Paired successfully! Automatically connected to {} via mDNS ({}).",
+                            target, svc.name
+                        ));
+                    }
+                    Err(err) => {
+                        return Ok(format!(
+                            "Paired successfully! Found {} via mDNS, but connect failed: {}",
+                            target, err
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(format!(
+            "Paired successfully with {}!\nNote: Android 11+ uses a separate port for connecting. Look at your phone's main 'Wireless debugging' screen (under 'IP address & Port') and connect to that port in Quick Connect.",
+            pair_address
+        ))
     }
 }

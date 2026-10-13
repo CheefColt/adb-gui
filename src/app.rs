@@ -1,4 +1,4 @@
-use crate::adb::{AdbManager, DeviceInfo};
+use crate::adb::{AdbManager, DeviceInfo, MdnsService};
 use crate::scanner::{ScanResult, SubnetScanner};
 use crate::storage::AppConfig;
 use chrono::Local;
@@ -32,6 +32,7 @@ pub enum AppMessage {
     AdbVersionDetected(Result<String, String>),
     ScanFound(ScanResult),
     ScanFinished,
+    MdnsServicesUpdated(Result<Vec<MdnsService>, String>),
 }
 
 pub struct AdbApp {
@@ -59,7 +60,12 @@ pub struct AdbApp {
     // Android 11+ Pairing Inputs
     pair_address: String,
     pair_code: String,
+    pair_connect_port: String,
     is_pairing: bool,
+
+    // mDNS Discovery State
+    mdns_services: Vec<MdnsService>,
+    is_refreshing_mdns: bool,
 
     // Scanner Tab State
     subnet_prefix: String,
@@ -114,7 +120,10 @@ impl AdbApp {
             is_connecting: false,
             pair_address: "192.168.1.:".to_string(),
             pair_code: String::new(),
+            pair_connect_port: String::new(),
             is_pairing: false,
+            mdns_services: Vec::new(),
+            is_refreshing_mdns: false,
             subnet_prefix: default_subnet,
             scan_port: "5555".to_string(),
             discovered_devices: Vec::new(),
@@ -131,6 +140,7 @@ impl AdbApp {
         // Detect ADB on start
         app.check_adb_version();
         app.refresh_devices();
+        app.refresh_mdns();
 
         app
     }
@@ -174,6 +184,44 @@ impl AdbApp {
         });
     }
 
+    pub fn refresh_mdns(&mut self) {
+        if self.is_refreshing_mdns {
+            return;
+        }
+        self.is_refreshing_mdns = true;
+        let manager = self.adb_manager.clone();
+        let sender = self.msg_sender.clone();
+        thread::spawn(move || {
+            let res = manager.list_mdns_services();
+            let _ = sender.send(AppMessage::MdnsServicesUpdated(res));
+        });
+    }
+
+    pub fn validate_ip_port(addr: &str) -> Result<(), String> {
+        let (ip_str, port_str) = addr
+            .split_once(':')
+            .ok_or_else(|| "Missing port. Format must be IP:PORT (e.g. 192.168.1.50:37123)".to_string())?;
+
+        let ip_trimmed = ip_str.trim();
+        let port_trimmed = port_str.trim();
+
+        if ip_trimmed.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(format!(
+                "Invalid IPv4 address '{}'. Expected standard 4-octet format (e.g. 192.168.29.49)",
+                ip_trimmed
+            ));
+        }
+
+        if port_trimmed.parse::<u16>().is_err() {
+            return Err(format!(
+                "Invalid port number '{}'. Must be between 1 and 65535",
+                port_trimmed
+            ));
+        }
+
+        Ok(())
+    }
+
     fn run_async_command<F>(&self, name: &'static str, f: F)
     where
         F: FnOnce(&AdbManager) -> Result<String, String> + Send + 'static,
@@ -203,6 +251,12 @@ impl AdbApp {
                         }
                     }
                 }
+                AppMessage::MdnsServicesUpdated(res) => {
+                    self.is_refreshing_mdns = false;
+                    if let Ok(list) = res {
+                        self.mdns_services = list;
+                    }
+                }
                 AppMessage::CommandFinished { cmd_name, result } => {
                     match result {
                         Ok(out) => {
@@ -214,6 +268,15 @@ impl AdbApp {
                             self.add_log(&cmd_name, true, &msg);
                             self.set_toast(&format!("{}: Success", cmd_name), true);
                             self.refresh_devices();
+                            if cmd_name == "Pair & Connect" || cmd_name == "Pair Device" {
+                                if let Some((ip, _)) = self.pair_address.split_once(':') {
+                                    let clean_ip = ip.trim().to_string();
+                                    if !clean_ip.is_empty() {
+                                        self.connect_ip = clean_ip;
+                                    }
+                                }
+                                self.refresh_mdns();
+                            }
                         }
                         Err(err) => {
                             self.add_log(&cmd_name, false, &err);
@@ -257,6 +320,7 @@ impl eframe::App for AdbApp {
         {
             self.last_auto_refresh = Instant::now();
             self.refresh_devices();
+            self.refresh_mdns();
         }
 
         // Top Panel: App Header & ADB Status
@@ -285,8 +349,9 @@ impl eframe::App for AdbApp {
                             m.start_server()
                         });
                     }
-                    if ui.button(if self.is_refreshing_devices { "🔄 Refreshing..." } else { "🔄 Refresh" }).clicked() {
+                    if ui.button(if self.is_refreshing_devices || self.is_refreshing_mdns { "🔄 Refreshing..." } else { "🔄 Refresh" }).clicked() {
                         self.refresh_devices();
+                        self.refresh_mdns();
                     }
                 });
             });
@@ -459,39 +524,114 @@ impl AdbApp {
 
                 ui.add_space(15.0);
 
-                // Column 2: Android 11+ Wireless Pairing
+                // Column 2: Android 11+ Wireless Pairing & mDNS Discovered Devices
                 ui.vertical(|ui| {
+                    ui.set_width(450.0);
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.heading("📶 Android 11+ Wireless Pairing");
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new(
-                            "1. On your phone: Settings > Developer options > Wireless debugging\n2. Tap 'Pair device with pairing code'\n3. Enter the IP, pairing port, and 6-digit code shown on your phone screen:"
+                            "1. On your phone: Settings > Developer options > Wireless debugging\n2. Tap 'Pair device with pairing code'\n3. Enter the Pairing IP:Port and 6-digit Code from the popup dialog.\n   (Connection Port from main screen is optional; auto-discovered via mDNS!)"
                         ).weak().size(12.0));
                         ui.add_space(8.0);
 
                         ui.horizontal(|ui| {
-                            ui.label("Pairing IP & Port:");
+                            ui.label("Pairing IP & Port:   ");
                             ui.add(egui::TextEdit::singleline(&mut self.pair_address).hint_text("192.168.1.xxx:xxxxx"));
                         });
 
                         ui.horizontal(|ui| {
-                            ui.label("6-Digit Code:      ");
+                            ui.label("6-Digit Code:        ");
                             ui.add(egui::TextEdit::singleline(&mut self.pair_code).hint_text("e.g. 123456"));
                         });
 
+                        ui.horizontal(|ui| {
+                            ui.label("Connect Port (opt):");
+                            ui.add(egui::TextEdit::singleline(&mut self.pair_connect_port).hint_text("Main screen port (or auto-detect)"));
+                        });
+
                         ui.add_space(8.0);
-                        let pair_btn = ui.add_sized([140.0, 30.0], egui::Button::new(
-                            egui::RichText::new("🔐 Pair Device").strong().color(egui::Color32::WHITE)
+                        let pair_btn_label = if self.is_pairing { "⏳ Pairing..." } else { "🔐 Pair & Connect" };
+                        let pair_btn = ui.add_sized([160.0, 30.0], egui::Button::new(
+                            egui::RichText::new(pair_btn_label).strong().color(egui::Color32::WHITE)
                         ).fill(egui::Color32::from_rgb(56, 161, 105)));
 
                         if pair_btn.clicked() && !self.is_pairing {
                             let addr = self.pair_address.trim().to_string();
                             let code = self.pair_code.trim().to_string();
-                            if !addr.is_empty() && !code.is_empty() {
-                                self.is_pairing = true;
-                                self.run_async_command("Pair Device", move |m| m.pair(&addr, &code));
-                            } else {
+
+                            if addr.is_empty() || code.is_empty() {
                                 self.set_toast("Please enter both pairing address and code", false);
+                            } else if let Err(err_msg) = Self::validate_ip_port(&addr) {
+                                self.set_toast(&err_msg, false);
+                                self.add_log("Pair & Connect", false, &err_msg);
+                            } else {
+                                let explicit_port = self.pair_connect_port.trim().parse::<u16>().ok();
+                                self.is_pairing = true;
+                                self.run_async_command("Pair & Connect", move |m| {
+                                    m.pair_and_auto_connect(&addr, &code, explicit_port)
+                                });
+                            }
+                        }
+                    });
+
+                    ui.add_space(10.0);
+
+                    // mDNS Discovered Devices Card
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("📡 Discovered Wireless Devices (mDNS)");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(if self.is_refreshing_mdns { "🔄 Scanning..." } else { "🔄 Scan mDNS" }).clicked() {
+                                    self.refresh_mdns();
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Wireless debugging devices discovered on your local network:").weak().size(12.0));
+                        ui.add_space(6.0);
+
+                        let connect_services: Vec<_> = self.mdns_services.iter()
+                            .filter(|s| s.service_type.contains("_adb-tls-connect") || s.service_type.contains("_adb."))
+                            .cloned()
+                            .collect();
+
+                        if connect_services.is_empty() {
+                            ui.label(egui::RichText::new("No wireless devices detected via mDNS yet. Make sure Wireless Debugging is enabled and your device is on the same Wi-Fi network.").weak());
+                        } else {
+                            let mut mdns_to_connect = None;
+
+                            for svc in connect_services {
+                                let target = format!("{}:{}", svc.ip, svc.port);
+                                let is_connected = self.devices.iter().any(|d| d.serial == target);
+
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("📶").size(14.0));
+                                    ui.vertical(|ui| {
+                                        ui.label(egui::RichText::new(&svc.name).strong().size(12.0));
+                                        ui.label(egui::RichText::new(&target).color(egui::Color32::from_rgb(99, 179, 237)).size(11.0));
+                                    });
+
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if is_connected {
+                                            ui.label(egui::RichText::new("● Connected").color(egui::Color32::from_rgb(72, 187, 120)).strong());
+                                        } else {
+                                            if ui.add_sized([90.0, 24.0], egui::Button::new("🔗 Connect")).clicked() {
+                                                mdns_to_connect = Some((svc.ip.clone(), svc.port, svc.name.clone()));
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                            }
+
+                            if let Some((ip, port, name)) = mdns_to_connect {
+                                self.connect_ip = ip.clone();
+                                self.connect_port = port.to_string();
+                                self.config.add_or_update_device(&ip, port, Some(name));
+                                let target = format!("{}:{}", ip, port);
+                                self.is_connecting = true;
+                                self.run_async_command("Connect", move |m| m.connect(&target));
                             }
                         }
                     });
